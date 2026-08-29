@@ -1,0 +1,12 @@
+# Session / credentials (Meta/Instagram login cookies)
+auth_state.json
+
+# Progress files and run artifacts
+*.progress.json
+*.progress.json.tmp
+error-*.png
+
+# Python
+venv/
+__pycache__/
+*.pyc
