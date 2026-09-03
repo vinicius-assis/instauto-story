@@ -59,16 +59,16 @@ HOW TO USE
 ============================================================================
 CALIBRATION (read before the first real run)
 ============================================================================
-The editor was walked through live on a real account (2026-08) and
-confirmed:
+The editor was walked through live on a real account (last checked 2026-09)
+and confirmed:
 
   - Upload: the "Adicionar foto/vídeo" button triggers a native file
     chooser; Playwright intercepts it with expect_file_chooser (no OS
     popup).
-  - Link sticker: "Figurinhas" -> "Link" button -> "Adicionar figurinha de
-    link" popover with 2 <input> fields: URL (no maxlength) and sticker
-    text (maxlength=25) -> the popover's "Aplicar" button creates the
-    sticker.
+  - Link sticker: "Figurinhas" panel -> "Mais figurinhas" -> "Link" button
+    -> "Adicionar figurinha de link" popover with 2 <input> fields: URL (no
+    maxlength) and sticker text (maxlength=25) -> the popover's "Aplicar"
+    button creates the sticker.
   - The sticker is a <div> with margin-left/margin-top (px) + position
     absolute; it is moved through JS mouse listeners (not HTML5 drag), so
     the script does mousedown -> mousemoves -> mouseup.
@@ -188,8 +188,8 @@ def select_page(page, page_name):
 
 
 # Meta Business Suite UI selectors/texts. Isolated here because this is what
-# breaks when Meta updates the interface — validated live in 2026-08 (see
-# notes in each function).
+# breaks when Meta updates the interface — last validated live in 2026-09
+# (see notes in each function).
 #
 # NOTE: the string VALUES stay in Portuguese on purpose: they must match the
 # real Meta Business Suite UI in the pt-BR locale. Only the constant names
@@ -198,7 +198,10 @@ TXT_CREATE_STORY = "Criar story"
 TXT_ADD_MEDIA = "Adicionar foto/vídeo"
 TXT_EDIT = "Editar"
 TXT_CREATION_TOOLS = "Ferramentas de criação"
-TXT_STICKERS = "Figurinhas"
+# The "Link" sticker moved (validated live 2026-09): the "Figurinhas" panel now
+# lists "Mencionar" and "Mais figurinhas"; "Link" only shows up after clicking
+# "Mais figurinhas" (it used to sit directly under a "Figurinhas" entry).
+TXT_MORE_STICKERS = "Mais figurinhas"
 TXT_LINK = "Link"
 TXT_LINK_POPOVER = "Adicionar figurinha de link"
 TXT_APPLY = "Aplicar"
@@ -334,8 +337,10 @@ def open_row_editor(page, row_index, total_media):
 
 def add_link_sticker(page, link_url, sticker_text=None):
     """
-    Real flow (validated live in 2026-08):
-      1. Click "Figurinhas" in the editor sidebar.
+    Real flow (validated live in 2026-09):
+      1. Click "Mais figurinhas" in the editor's "Figurinhas" panel (the "Link"
+         button used to sit directly under "Figurinhas"; now it is revealed by
+         "Mais figurinhas").
       2. Click the "Link" button -> opens the "Adicionar figurinha de link"
          popover.
       3. The popover has 2 <input type=text>: the URL one (no maxlength) and
@@ -344,8 +349,11 @@ def add_link_sticker(page, link_url, sticker_text=None):
       4. Click the popover's "Aplicar" button (not the modal footer one) ->
          the sticker appears over the image and the popover closes.
     """
-    log("Opening the Stickers panel...")
-    page.get_by_text(TXT_STICKERS, exact=True).first.click()
+    log("Opening the 'Mais figurinhas' panel...")
+    try:
+        page.get_by_role("button", name=TXT_MORE_STICKERS, exact=True).first.click(timeout=4000)
+    except PWTimeout:
+        page.get_by_text(TXT_MORE_STICKERS, exact=True).first.click()
     page.wait_for_timeout(400)
 
     log("Clicking 'Link'...")
