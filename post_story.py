@@ -53,8 +53,14 @@ HOW TO USE
                                       have confirmed the flow is fully
                                       calibrated)
 
-   The script NEVER clicks "Compartilhar" (Share) — it builds the stories
-   in the composer and STOPS. You review and publish manually.
+   IMPORTANT — the script DOES click "Compartilhar" (Share) automatically,
+   for every batch it builds. In --manifest mode, since Meta only accepts
+   up to 10 media items per composer, it loops: build up to 10, share,
+   pause, build the next up to 10, share, and so on until every pending
+   story is published, with no manual confirmation in between. Run the
+   first batch with a small manifest and without --headless to confirm
+   the "Compartilhar" click behaves as expected on your account before
+   trusting it with a large batch.
 
 ============================================================================
 CALIBRATION (read before the first real run)
@@ -445,6 +451,53 @@ def position_sticker(page, y_ratio, x_ratio=STICKER_X_RATIO):
         f"(target {y_ratio:.3f}). Check it visually.")
 
 
+def click_share(page, timeout_s=60):
+    """
+    Clicks the composer's "Compartilhar" button and waits for confirmation
+    that the batch was actually published (the media rows reset to empty,
+    i.e. the "Editar" button count drops back to 0).
+
+    NOT YET LIVE-VALIDATED end-to-end on a real account: the sticker flow
+    was calibrated live, but this final click was not (the script used to
+    stop before it on purpose). Run the first batch without --headless and
+    watch closely; if Meta shows an extra confirmation dialog or the
+    post-share UI differs, adjust this function accordingly.
+    """
+    log("Clicking 'Compartilhar'...")
+    share_btn = page.get_by_role("button", name=TXT_SHARE, exact=True).first
+    share_btn.wait_for(state="visible", timeout=10000)
+    share_btn.click()
+
+    # Meta may show a secondary confirmation dialog before actually
+    # publishing. If another "Compartilhar" button appears, click it too.
+    page.wait_for_timeout(800)
+    try:
+        confirm_btn = page.get_by_role("button", name=TXT_SHARE, exact=True).first
+        if confirm_btn.is_visible():
+            confirm_btn.click()
+    except Exception:
+        pass
+
+    log("Waiting for the composer to confirm the stories were published...")
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if _count_edit_row_buttons(page) == 0:
+            page.wait_for_timeout(500)
+            log("Share confirmed (composer reset).")
+            return
+        page.wait_for_timeout(1000)
+
+    shot = f"error-share-{int(time.time())}.png"
+    try:
+        page.screenshot(path=shot)
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"Could not confirm the share completed within {timeout_s}s "
+        f"(composer still shows media rows). Screenshot: {shot}."
+    )
+
+
 def apply_and_close_editor(page):
     log("Applying the editor changes...")
     tools = page.get_by_text(TXT_CREATION_TOOLS, exact=False).first
@@ -487,11 +540,6 @@ def edit_row_media(page, row_index, total_media, link_url, y_ratio,
             action()
         except Exception as e:
             raise RuntimeError(f"failed at step '{name}': {e}") from e
-
-
-# NOTE: the script NEVER clicks "Compartilhar" (Share). That action is
-# always manual. It builds the stories in the composer and stops; you review
-# and publish by hand.
 
 
 # --------------------------------------------------------------------------
@@ -633,12 +681,79 @@ def _launch(pw, args):
     return browser, context.new_page()
 
 
+def _build_one_batch(page, batch, image_paths, progress_path, args):
+    """
+    Uploads and builds ONE batch (<=10 items) in the composer: adds every
+    image, then adds+positions the link sticker on each row. Returns
+    (built, failures). Raises on an upload failure (nothing was built yet,
+    so the caller can safely stop without marking anything as published).
+    """
+    try:
+        add_all_media(page, image_paths)
+    except Exception as e:
+        shot = progress_path.with_name(f"error-upload-{int(time.time())}.png")
+        try:
+            page.screenshot(path=str(shot))
+            log(f"Screenshot saved to {shot.name}")
+        except Exception:
+            pass
+        raise RuntimeError(f"uploading the media: {e}") from e
+
+    built, failures = [], []
+    for idx, story in enumerate(batch):
+        n = idx + 1
+        log("")
+        log(f"=== [{n}/{len(batch)}] building story (id={story['id']}) ===")
+        log(f"    image={story['image']}")
+        log(f"    link={story['link']}  sticker={story['sticker_text']!r}"
+            f"  x_ratio={story['sticker_x_ratio']:.3f}"
+            f"  y_ratio={story['sticker_y_ratio']:.3f}")
+        try:
+            edit_row_media(
+                page, idx, len(batch),
+                link_url=story["link"],
+                y_ratio=story["sticker_y_ratio"],
+                sticker_text=story["sticker_text"],
+                x_ratio=story["sticker_x_ratio"],
+            )
+            built.append(story)
+            log(f"    OK — sticker applied on media #{n} "
+                f"({len(built)}/{len(batch)} built so far).")
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            shot = progress_path.with_name(f"error-{story['id']}-{int(time.time())}.png")
+            try:
+                page.screenshot(path=str(shot))
+                log(f"Error screenshot saved to {shot.name}")
+            except Exception:
+                pass
+            log("ERROR building this story:")
+            log(f"    id={story['id']}  image={story['image']}  ({image_paths[idx]})")
+            log(f"    link={story['link']}  sticker={story['sticker_text']!r}")
+            log(f"    error: {e}")
+            failures.append((story, str(e)))
+            if input(">>> Keep building the rest of this batch? [y/N] ").strip().lower() != "y":
+                break
+
+        if n < len(batch):
+            _sleep_with_log(
+                random.randint(args.pause_min, args.pause_max),
+                "pacing between edits",
+            )
+            log(f"--> moving on to build story #{n + 1}...")
+
+    return built, failures
+
+
 def run_manifest(pw, args):
     """
-    Builds ALL pending stories (up to --max-per-run) in a SINGLE composer —
-    one image + one link sticker at a time — and STOPS before sharing, so
-    you can review everything and click 'Compartilhar' once. (Meta publishes
-    every media item in the composer at once.)
+    Publishes ALL pending stories from the manifest, automatically, looping
+    over batches of up to --max-per-run (Meta's own ceiling is 10 per
+    composer): build a batch (one image + one link sticker at a time),
+    click 'Compartilhar', confirm it went through, mark those ids as
+    published, pause, and move to the next batch — until every story is
+    published or a failure stops the run.
     """
     manifest, base_dir, mbytes, progress_path, cleanup = load_manifest(args.manifest)
     try:
@@ -668,122 +783,95 @@ def run_manifest(pw, args):
         done_ids = {p["id"] for p in progress["published"] if p.get("status") == "ok"}
         all_stories = manifest["stories"]
         total = len(all_stories)
-        pending = [resolve_story(manifest, s, args.sticker_y_ratio)
-                   for s in all_stories if s["id"] not in done_ids]
 
-        if not pending:
+        def pending_stories():
+            return [resolve_story(manifest, s, args.sticker_y_ratio)
+                    for s in all_stories if s["id"] not in done_ids]
+
+        if not pending_stories():
             log(f"Batch complete — {total}/{total} already published. Nothing to do.")
             return
 
-        batch = pending[: args.max_per_run]
-        log(f"{len(done_ids)}/{total} already published. {len(pending)} pending; "
-            f"this run builds {len(batch)} (--max-per-run {args.max_per_run}).")
-        for i, st in enumerate(batch, 1):
-            log(f"  {i}. {st['image']}  ->  {st['link']}  (sticker {st['sticker_text']!r})")
-
-        image_paths = [str((base_dir / st["image"]).resolve()) for st in batch]
+        log(f"AUTOMATIC MODE: every batch built will be shared (published) "
+            f"immediately, with no manual confirmation. Interrupt now "
+            f"(Ctrl+C) if you wanted to review first.")
 
         browser, page = _launch(pw, args)
         try:
-            try:
-                open_composer(page, manifest.get("page"))
-                add_all_media(page, image_paths)
-            except Exception as e:
-                shot = progress_path.with_name(f"error-upload-{int(time.time())}.png")
-                try:
-                    page.screenshot(path=str(shot))
-                    log(f"Screenshot saved to {shot.name}")
-                except Exception:
-                    pass
-                log(f"ERROR uploading the media: {e}")
-                log("Nothing was built; nothing marked. Fix it and run again.")
-                return
+            batch_num = 0
+            while True:
+                pending = pending_stories()
+                if not pending:
+                    log(f"All done: {total}/{total} published.")
+                    break
 
-            built, failures = [], []
-            for idx, story in enumerate(batch):
-                n = idx + 1
+                batch_num += 1
+                batch = pending[: args.max_per_run]
                 log("")
-                log(f"=== [{n}/{len(batch)}] building story (id={story['id']}) ===")
-                log(f"    image={story['image']}")
-                log(f"    link={story['link']}  sticker={story['sticker_text']!r}"
-                    f"  x_ratio={story['sticker_x_ratio']:.3f}"
-                    f"  y_ratio={story['sticker_y_ratio']:.3f}")
+                log("=" * 60)
+                log(f"--- Batch #{batch_num}: {len(done_ids)}/{total} published so far, "
+                    f"{len(pending)} pending, building {len(batch)} now "
+                    f"(--max-per-run {args.max_per_run}) ---")
+                for i, st in enumerate(batch, 1):
+                    log(f"  {i}. {st['image']}  ->  {st['link']}  (sticker {st['sticker_text']!r})")
+
+                image_paths = [str((base_dir / st["image"]).resolve()) for st in batch]
+
                 try:
-                    edit_row_media(
-                        page, idx, len(batch),
-                        link_url=story["link"],
-                        y_ratio=story["sticker_y_ratio"],
-                        sticker_text=story["sticker_text"],
-                        x_ratio=story["sticker_x_ratio"],
-                    )
-                    built.append(story)
-                    log(f"    OK — sticker applied on media #{n} "
-                        f"({len(built)}/{len(batch)} built so far).")
-                except KeyboardInterrupt:
-                    raise
+                    open_composer(page, manifest.get("page"))
+                    built, failures = _build_one_batch(page, batch, image_paths, progress_path, args)
                 except Exception as e:
-                    shot = progress_path.with_name(f"error-{story['id']}-{int(time.time())}.png")
-                    try:
-                        page.screenshot(path=str(shot))
-                        log(f"Error screenshot saved to {shot.name}")
-                    except Exception:
-                        pass
-                    log("ERROR building this story:")
-                    log(f"    id={story['id']}  image={story['image']}  ({image_paths[idx]})")
-                    log(f"    link={story['link']}  sticker={story['sticker_text']!r}")
-                    log(f"    error: {e}")
-                    failures.append((story, str(e)))
-                    if input(">>> Keep building the rest? [y/N] ").strip().lower() != "y":
-                        log("Stopped. Nothing was marked as published; "
-                            "run the same command to restart the batch.")
-                        return
+                    log(f"ERROR building batch #{batch_num}: {e}")
+                    log("Nothing in this batch was marked as published. "
+                        "Fix it and run the same command again to resume.")
+                    return
 
-                if n < len(batch):
-                    _sleep_with_log(
-                        random.randint(args.pause_min, args.pause_max),
-                        "pacing between edits",
-                    )
-                    log(f"--> moving on to build story #{n + 1}...")
+                if failures:
+                    log(f"{len(failures)} failed in this batch "
+                        f"(image in the composer, but WITHOUT a sticker):")
+                    for st, err in failures:
+                        log(f"    - {st['image']}: {err[:120]}")
 
-            log("=" * 60)
-            log(f"Loop done. {len(built)}/{len(batch)} stories built in the composer.")
-            if failures:
-                log(f"{len(failures)} failed (the image is in the composer, but WITHOUT a sticker):")
-                for st, err in failures:
-                    log(f"    - {st['image']}: {err[:120]}")
+                if not built:
+                    log("Nothing was built in this batch. Stopping without sharing.")
+                    return
 
-            log("")
-            log("The script does NOT share anything — that action is always manual.")
-            log("Review ALL stories in the browser window "
-                "(use the '>' arrow in the preview to move between them) and "
-                "click 'Compartilhar' yourself when it looks right.")
-            resp = input(
-                ">>> Did you click 'Compartilhar' and publish? "
-                "[y = mark these ids as done / n = do not mark] "
-            ).strip().lower()
-            published = (resp == "y")
+                try:
+                    click_share(page)
+                except Exception as e:
+                    log(f"ERROR sharing batch #{batch_num}: {e}")
+                    log("Nothing in this batch was marked as published (the share "
+                        "may or may not have gone through — check the account "
+                        "before re-running to avoid duplicates).")
+                    return
 
-            if published:
                 for story in built:
                     progress["published"].append({
                         "id": story["id"], "at": _now_iso(), "status": "ok",
                         "image": story["image"], "link": story["link"],
                     })
+                    done_ids.add(story["id"])
                 save_progress(progress_path, progress)
-                ok_count = sum(1 for p in progress["published"] if p["status"] == "ok")
-                log(f"Progress saved: {ok_count}/{total} published.")
-                remaining = total - ok_count
-                if remaining > 0:
-                    log(f"{remaining} left. Run the same command to build the next batch.")
-                else:
-                    log(f"Batch complete: {total}/{total}.")
-            else:
-                log("Nothing marked as published. Run the same command to redo the batch.")
+                ok_count = len(done_ids)
+                log(f"Batch #{batch_num} published and progress saved: "
+                    f"{ok_count}/{total} done.")
+
+                if failures:
+                    log("Stopping after this batch because some items failed to "
+                        "build (see above). Fix the manifest/images and run "
+                        "again to resume with the rest.")
+                    return
+
+                if pending_stories():
+                    _sleep_with_log(
+                        random.randint(args.batch_pause_min, args.batch_pause_max),
+                        "pacing between batches",
+                    )
         except KeyboardInterrupt:
             log("")
             log("*** Ctrl+C — run interrupted by the user. ***")
-            log("Nothing was marked as published. The browser is still open: "
-                "you can finish building/publishing by hand if you want.")
+            log("Batches already shared above were marked as published. "
+                "The browser is still open if you want to check the account.")
         except Exception as e:
             shot = progress_path.with_name(f"error-unexpected-{int(time.time())}.png")
             try:
@@ -792,7 +880,7 @@ def run_manifest(pw, args):
                 pass
             log("")
             log(f"*** UNEXPECTED ERROR: {type(e).__name__}: {e} ***")
-            log(f"Screenshot: {shot.name}. Nothing was marked as published.")
+            log(f"Screenshot: {shot.name}.")
             import traceback
             log(traceback.format_exc())
         finally:
@@ -819,9 +907,8 @@ def run_single(pw, args):
         edit_row_media(page, 0, 1, args.link, y_ratio, args.sticker_text,
                        x_ratio=x_ratio)
 
-        log("All set. The script does NOT share — that action is manual.")
-        log("Review it in the browser and click 'Compartilhar' yourself.")
-        input(">>> Press ENTER to finish (the browser will close)... ")
+        click_share(page)
+        log("Published.")
     except Exception as e:
         try:
             page.screenshot(path=f"error-{int(time.time())}.png")
@@ -869,6 +956,12 @@ def main():
     batch.add_argument("--pause-max", type=int, default=16,
                        help="Maximum pause (s) between editing one media item and the "
                             "next (default: 16).")
+    batch.add_argument("--batch-pause-min", type=int, default=30,
+                       help="Minimum pause (s) after sharing one batch before opening "
+                            "the composer for the next batch (default: 30).")
+    batch.add_argument("--batch-pause-max", type=int, default=90,
+                       help="Maximum pause (s) after sharing one batch before opening "
+                            "the composer for the next batch (default: 90).")
     batch.add_argument("--reset-progress", action="store_true",
                        help="Delete the .progress.json file and restart the batch from scratch.")
 

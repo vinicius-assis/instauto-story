@@ -7,9 +7,13 @@ Bons Achados.
 
 - **What it does:** uploads an image (or a batch of images), opens the
   Story editor, adds a link sticker with your URL, drags it to a calibrated
-  position, and **stops**. It never publishes.
-- **What it does NOT do:** it never clicks *"Compartilhar"* (Share).
-  Publishing is always a manual step you do yourself after reviewing.
+  position, clicks *"Compartilhar"* (Share) to publish it, and — in batch
+  mode — repeats automatically for the next batch of up to 10 until
+  everything in the manifest is published.
+- **Publishing is automatic.** The script clicks *"Compartilhar"* itself, for
+  every batch, with no manual confirmation step. There is no flag to fall
+  back to a review-only mode; run a small batch without `--headless` first
+  to confirm the flow before trusting it with a large one.
 
 ---
 
@@ -37,13 +41,15 @@ account suspension if the usage is flagged as automated.
 
 Mitigations built into the script:
 
-- It **never** clicks *"Compartilhar"* — you always review and publish by hand.
 - Realistic delays between actions (`slow_mo`, human-like drag, random
-  4–16 s pauses between edits in batch mode).
+  4–16 s pauses between edits, and a longer 30–90 s pause between batches).
 - Per-story position **jitter** so the sticker does not land on the exact
   same relative pixel across a whole batch.
 
-Still: keep batches small and use it sparingly.
+Because the script now clicks *"Compartilhar"* itself and loops
+unattended across batches, the account-suspension risk above is higher
+than a review-then-publish-by-hand flow. Keep batches small, watch the
+first run without `--headless`, and use it sparingly.
 
 ---
 
@@ -54,7 +60,7 @@ flow was walked through live on a real account (2026-08) and the selectors
 were fixed against the actual DOM.
 
 ```
-open_composer ──> add_all_media ──> for each media row: edit_row_media ──> STOP
+open_composer ──> add_all_media ──> for each media row: edit_row_media ──> click_share ──> next batch (if any)
                                         │
                                         ├─ open_row_editor      (click the row's "Editar")
                                         ├─ add_link_sticker      ("Figurinhas" -> "Link" -> popover)
@@ -71,7 +77,7 @@ Key mechanics:
 | **Link sticker** | *"Figurinhas"* → *"Link"* button → the *"Adicionar figurinha de link"* popover, which has two `<input>` fields: URL (no `maxlength`) and sticker text (`maxlength=25`). The **popover's** *"Aplicar"* button (not the modal footer one) creates the sticker. |
 | **Positioning** | The sticker is a `<div>` with `margin-left/margin-top` (px) + `position:absolute`, moved via **JS mouse listeners** (not HTML5 drag). `human_drag` does `mousedown → many mousemoves → mouseup`. The drag "slips" (the sticker travels ~2/3 of the cursor), so `position_sticker` measures where it stopped and does **corrective drags** until it is within `STICKER_TOLERANCE` (0.02) of the target, relative to the rendered `<img._5i4g>` artwork rectangle. |
 | **Apply** | The modal footer *"Aplicar"* closes the editor; Meta re-processes the media (the row briefly turns into a skeleton — the script waits for all rows to come back before editing the next one). |
-| **Publish** | **Manual.** The *"Compartilhar"* button publishes every media item in the composer at once. The script never clicks it. |
+| **Publish** | **Automatic.** `click_share` clicks *"Compartilhar"*, which publishes every media item in the composer at once, then waits for the composer to reset (media rows drop to 0) before the script marks that batch as published and moves on. |
 
 **UI text selectors** live together near the top of `post_story.py`
 (`TXT_CREATE_STORY`, `TXT_ADD_MEDIA`, `TXT_STICKERS`, …). Their string
@@ -140,8 +146,8 @@ python post_story.py --image path/to/image.jpg --link "https://yoursite.com/prod
 - `--link` — must start with `https://`.
 
 The script uploads the image, adds the link sticker, drags it to the
-calibrated position, and leaves the browser open for you to review and
-click *"Compartilhar"* **manually**.
+calibrated position, and clicks *"Compartilhar"* itself — the story is
+published by the time the script finishes.
 
 ### All flags
 
@@ -187,37 +193,42 @@ to a `manifest.json`.
 1. Validates the **entire** manifest before opening the browser (version,
    unique `id`s, images exist and stay inside the manifest folder, links
    are `https://`).
-2. Opens **one composer** and uploads every image in the batch (up to
-   `--max-per-run`, default 10 — Meta's limit).
+2. Opens **one composer** and uploads the next pending batch of images (up
+   to `--max-per-run`, default 10 — Meta's limit).
 3. Edits **one media at a time**: opens that image's editor, adds the link
    sticker, positions it (corrective drags), applies.
-4. **Stops.** It never clicks *"Compartilhar"*. You review every story in
-   the window (the `>` arrow in the preview navigates between them) and
-   click *"Compartilhar"* yourself — one click publishes them all.
-5. In the terminal, it asks whether you shared. Answer `y` and the batch's
-   `id`s are recorded in `<name>.progress.json`. Running the same command
-   again skips the published ones and builds the next batch.
+4. Clicks *"Compartilhar"* automatically, waits for confirmation the
+   composer published (media rows reset to 0), and records that batch's
+   `id`s as done in `<name>.progress.json`.
+5. If there is still pending work, pauses (30–90 s by default) and repeats
+   from step 2 with the next batch of up to 10 — in the **same run** —
+   until the whole manifest is published or a failure stops it.
 
 If a media fails mid-batch, that image stays in the composer without a
-sticker and the script asks whether to continue with the rest; nothing is
-marked until you confirm.
+sticker; the script asks whether to continue building the rest of that
+batch. Whatever did build is still shared and marked as published; the run
+then stops so you can fix the failure before resuming.
 
 ### Batch-mode flags
 
 | Flag | Default | Description |
 |---|---|---|
 | `--manifest PATH` | — | `manifest.json` or a `.zip` containing it. Replaces `--image`/`--link`. |
-| `--max-per-run N` | `10` | Max media items built in one composer per run (Meta's ceiling). |
-| `--pause-min N` / `--pause-max N` | `4` / `16` | Random pause (s) between editing one media and the next. |
+| `--max-per-run N` | `10` | Max media items built (and shared) per composer batch (Meta's ceiling). |
+| `--pause-min N` / `--pause-max N` | `4` / `16` | Random pause (s) between editing one media and the next, within a batch. |
+| `--batch-pause-min N` / `--batch-pause-max N` | `30` / `90` | Random pause (s) after sharing one batch before opening the composer for the next one. |
 | `--sticker-y-ratio N` | `0.73` | Base sticker position for **all** stories (the manifest value, if any, is ignored). |
 | `--reset-progress` | — | Delete `<name>.progress.json` and restart the batch from scratch. |
 
 ### Batches larger than 10
 
-Meta's composer accepts at most **10** media per publish. For a batch of
-30: run → it builds 10 → you review and click *"Compartilhar"* → confirm in
-the terminal; run again → it builds the next 10; repeat. It is all one
-manifest — the producing app does not need to split anything.
+Meta's composer accepts at most **10** media per publish. For a manifest of
+30, a single run of the script builds 10, clicks *"Compartilhar"*, pauses,
+builds the next 10, shares, pauses, builds the last 10, shares — all
+automatically, in one run. It is all one manifest — the producing app does
+not need to split anything, and you don't need to re-run the command
+between batches. If the run is interrupted partway, running the same
+command again resumes from the next pending batch.
 
 ### Simple manual loop (alternative to `--manifest`)
 
@@ -280,12 +291,11 @@ manifest (or the zip):
 }
 ```
 
-- The batch is **all-or-nothing**: the script builds every media in the
-  composer and only marks the `id`s as `"ok"` after you confirm in the
-  terminal that you clicked *"Compartilhar"* (Meta publishes them all at
-  once).
-- On the next run it skips every `id` already marked `"ok"` and builds the
-  next batch.
+- Each batch is built, shared automatically, and only then are its `id`s
+  marked as `"ok"` — a batch is only recorded as published once
+  `click_share` confirms the composer actually reset.
+- On the next run (or the next automatic batch within the same run) it
+  skips every `id` already marked `"ok"` and builds the next one.
 - If `manifest.json` changed since the last run (different
   `manifest_hash`), it warns and asks before resuming.
 - `--reset-progress` deletes the file and starts over.
